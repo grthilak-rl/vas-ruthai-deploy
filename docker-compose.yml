@@ -1,0 +1,234 @@
+# =============================================================================
+# vas-ruthai-deploy — Merged VAS + Ruth AI deployment
+# =============================================================================
+#
+# Imports VAS service definitions from ../vas-ms-v2/deploy/docker-compose.yml
+# (sibling clone) and inlines Ruth AI services until ruth-ai-vas-ms-v2 grows
+# its own deploy/ subdirectory.
+#
+# Layout assumed (siblings under /home/project or wherever you clone):
+#   ../vas-ms-v2/                  ← VAS app repo, has deploy/
+#   ../ruth-ai-vas-ms-v2/          ← Ruth AI repo (no deploy/ yet)
+#   ./vas-ruthai-deploy/           ← this repo, where you run docker compose
+#
+# Usage:
+#   ./bootstrap.sh                 # clones siblings if missing, prompts for .env
+#   docker compose up -d
+#   open http://${HOST_IP}:${VAS_HTTP_PORT}
+#
+# When ruth-ai-vas-ms-v2 gains its own deploy/docker-compose.yml, replace
+# the inlined Ruth AI services block below with a second include:
+#   include:
+#     - ../vas-ms-v2/deploy/docker-compose.yml
+#     - ../ruth-ai-vas-ms-v2/deploy/docker-compose.yml
+# =============================================================================
+
+include:
+  - ../vas-ms-v2/deploy/docker-compose.yml
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────
+  # VAS service overrides
+  # Pin container names to match what the operator and external monitoring
+  # know from the pre-restructure live deploy (vas-ms-v2-*).
+  # ──────────────────────────────────────────────────────────────────────
+  vas-db:
+    container_name: vas-ms-v2-db
+  vas-redis:
+    container_name: vas-ms-v2-redis
+  vas-mediasoup:
+    container_name: vas-ms-v2-mediasoup
+  vas-backend:
+    container_name: vas-ms-v2-backend
+  vas-frontend:
+    container_name: vas-ms-v2-frontend
+  vas-nginx:
+    container_name: vas-ms-v2-nginx
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Ruth AI services
+  # TODO(repo-split): when ruth-ai-vas-ms-v2 grows its own deploy/ dir,
+  # move these definitions there and add a second `include:` line above.
+  # Build contexts here use sibling-relative paths (../ruth-ai-vas-ms-v2/...)
+  # which assumes the repo layout described in the file header.
+  # ──────────────────────────────────────────────────────────────────────
+
+  ruth-ai-db:
+    image: postgres:15-alpine
+    container_name: ruth-ai-vas-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${RUTH_POSTGRES_USER:-ruth}
+      POSTGRES_PASSWORD: ${RUTH_POSTGRES_PASSWORD:?RUTH_POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${RUTH_POSTGRES_DB:-ruth_ai}
+    ports:
+      - "5434:5432"
+    volumes:
+      - ruth-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${RUTH_POSTGRES_USER:-ruth} -d ${RUTH_POSTGRES_DB:-ruth_ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ruth-ai-internal
+
+  ruth-ai-redis:
+    image: redis:7-alpine
+    container_name: ruth-ai-vas-redis
+    restart: unless-stopped
+    ports:
+      - "6382:6379"
+    volumes:
+      - ruth-redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - ruth-ai-internal
+
+  ruth-ai-backend:
+    build:
+      context: ../ruth-ai-vas-ms-v2/ruth-ai-backend
+      dockerfile: Dockerfile
+    container_name: ruth-ai-vas-backend
+    restart: unless-stopped
+    ports:
+      - "8090:8080"
+    environment:
+      RUTH_AI_ENV: ${RUTH_AI_ENV:-development}
+      RUTH_AI_LOG_LEVEL: ${RUTH_AI_LOG_LEVEL:-info}
+      RUTH_AI_LOG_FORMAT: json
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATABASE_URL: postgresql+asyncpg://${RUTH_POSTGRES_USER:-ruth}:${RUTH_POSTGRES_PASSWORD}@ruth-ai-db:5432/${RUTH_POSTGRES_DB:-ruth_ai}
+      DATABASE_POOL_SIZE: 10
+      DATABASE_POOL_OVERFLOW: 5
+      REDIS_URL: redis://ruth-ai-redis:6379/0
+      REDIS_MAX_CONNECTIONS: 50
+      # Integration glue: Ruth AI reaches VAS via host gateway since VAS
+      # backend uses network_mode: host. Port comes from the same env var
+      # the included VAS compose uses, so they stay in sync.
+      VAS_BASE_URL: http://host.docker.internal:${VAS_BACKEND_PORT:-8085}
+      VAS_CLIENT_ID: ${VAS_CLIENT_ID:-ruth-ai-backend}
+      VAS_CLIENT_SECRET: ${VAS_CLIENT_SECRET:?VAS_CLIENT_SECRET must be set in .env}
+      VAS_TOKEN_REFRESH_MARGIN_SEC: 300
+      VAS_REDIS_URL: redis://host.docker.internal:${VAS_REDIS_HOST_PORT:-6380}
+      JWT_SECRET_KEY: ${RUTH_JWT_SECRET:?RUTH_JWT_SECRET must be set in .env}
+      JWT_ALGORITHM: HS256
+      JWT_EXPIRY_MINUTES: 60
+      NLP_CHAT_SERVICE_URL: http://ruth-ai-nlp-chat:8081
+      NLP_CHAT_TIMEOUT_SECONDS: ${NLP_CHAT_TIMEOUT_SECONDS:-120}
+      UNIFIED_RUNTIME_URL: http://unified-ai-runtime:8000
+      UNIFIED_RUNTIME_ENABLE: "true"
+      UNIFIED_RUNTIME_TIMEOUT: ${UNIFIED_RUNTIME_TIMEOUT:-30.0}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      ruth-ai-db:
+        condition: service_healthy
+      ruth-ai-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - ruth-ai-internal
+
+  unified-ai-runtime:
+    build:
+      context: ../ruth-ai-vas-ms-v2/ai
+      dockerfile: Dockerfile
+      args:
+        - VARIANT=gpu
+    container_name: ruth-ai-unified-runtime
+    restart: unless-stopped
+    ports:
+      - "8012:8000"
+    volumes:
+      - ../ruth-ai-vas-ms-v2/ai/models:/app/ai/models:ro
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=info
+      - MODELS_ROOT=/app/ai/models
+      - MAX_CONCURRENT_INFERENCES=10
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+      - BACKEND_URL=http://ruth-ai-vas-backend:8080
+      - BACKEND_INTEGRATION_ENABLED=true
+      - BACKEND_HEALTH_PUSH_INTERVAL_SECONDS=30
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    networks:
+      - ruth-ai-internal
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  # NOTE: ruth-ai-nlp-chat and ollama services are intentionally NOT
+  # included here. They were disabled in the pre-restructure compose
+  # (GPU 1 reassigned to vas-backend nvenc; ollama-dependent services
+  # disabled as a result). Restore them in this file if/when GPU
+  # capacity allows.
+
+  ruth-ai-frontend:
+    build:
+      context: ../ruth-ai-vas-ms-v2/frontend
+      dockerfile: Dockerfile
+    container_name: ruth-ai-vas-frontend
+    restart: unless-stopped
+    ports:
+      - "3300:80"
+    environment:
+      VAS_PROXY_URL: http://host.docker.internal:${VAS_BACKEND_PORT:-8085}
+      VITE_API_BASE_URL: http://localhost:8080
+      VITE_VAS_WEBRTC_URL: ${VAS_WEBRTC_URL:-ws://10.40.128.10:3002}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ruth-ai-internal
+
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  ruth-ai-internal:
+    name: ruth-ai-vas-internal
+    driver: bridge
+
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  ruth-postgres-data:
+    name: ruth-ai-vas-postgres-data
+  ruth-redis-data:
+    name: ruth-ai-vas-redis-data
