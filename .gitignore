@@ -1,0 +1,8 @@
+# Operator-supplied secrets and host-specific config.
+# This file MUST never be committed.
+.env
+
+# Backups of pre-restructure files (kept on host disk for rollback,
+# not part of this repo).
+*.bak
+*.bak-*
