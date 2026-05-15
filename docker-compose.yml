@@ -129,6 +129,12 @@ services:
       JWT_SECRET_KEY: ${RUTH_JWT_SECRET:?RUTH_JWT_SECRET must be set in .env}
       JWT_ALGORITHM: HS256
       JWT_EXPIRY_MINUTES: 60
+      # NLP Chat is intentionally disabled in this deploy (GPU 1 reassigned
+      # to vas-backend nvenc). Setting NLP_CHAT_ENABLED=false makes Ruth
+      # skip the startup connect, return "disabled" from the health check,
+      # and stop dragging overall health to "unhealthy". Restore to true
+      # if/when the ruth-ai-nlp-chat + ollama services come back online.
+      NLP_CHAT_ENABLED: "false"
       NLP_CHAT_SERVICE_URL: http://ruth-ai-nlp-chat:8081
       NLP_CHAT_TIMEOUT_SECONDS: ${NLP_CHAT_TIMEOUT_SECONDS:-120}
       UNIFIED_RUNTIME_URL: http://unified-ai-runtime:8000
