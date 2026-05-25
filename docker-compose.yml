@@ -262,16 +262,16 @@ networks:
 # VOLUMES
 # =============================================================================
 volumes:
-  # VAS data volumes: external so this compose reuses the live data from
-  # the pre-restructure deploy. external: true means Compose will fail
-  # fast if these don't exist on disk, instead of silently creating fresh
-  # empty ones (which would put backend into a fresh-DB Alembic loop).
+  # VAS data volumes. Explicit `name:` directives mean Compose will
+  # ADOPT an existing volume of the same name if one is on the host
+  # (the project server's live data), and CREATE it on a fresh host
+  # if absent. Either way no operator pre-step is required.
+  # Volume names match the pre-restructure deploy so live data
+  # carries forward unchanged.
   vas-ms-v2-postgres-data:
     name: vas-ms-v2-postgres-data
-    external: true
   vas-ms-v2-redis-data:
     name: vas-ms-v2-redis-data
-    external: true
 
   ruth-postgres-data:
     name: ruth-ai-vas-postgres-data
