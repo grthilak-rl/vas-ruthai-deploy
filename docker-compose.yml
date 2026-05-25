@@ -54,6 +54,16 @@ services:
       MEDIASOUP_ANNOUNCED_IP: ${HOST_IP:?HOST_IP must be set in .env (host IP reachable by browser clients)}
   vas-backend:
     container_name: vas-ms-v2-backend
+    environment:
+      # VAS<->Ruth credential contract. The operator sets a single
+      # VAS_CLIENT_SECRET in the integration .env; compose maps it
+      # to both sides:
+      #   - VAS:  seeds the ruth-ai-backend OAuth client at startup
+      #           via seed_ruth_client() — see vas-ms-v2 main.py
+      #   - Ruth: reads it as VAS_CLIENT_SECRET to authenticate.
+      # VAS standalone leaves VAS_RUTH_CLIENT_SECRET unset and skips
+      # the seeding entirely (no-op, single info log line).
+      VAS_RUTH_CLIENT_SECRET: ${VAS_CLIENT_SECRET:?VAS_CLIENT_SECRET must be set in .env (VAS<->Ruth contract)}
   vas-frontend:
     container_name: vas-ms-v2-frontend
   vas-nginx:
