@@ -45,6 +45,13 @@ services:
       - vas-ms-v2-redis-data:/data
   vas-mediasoup:
     container_name: vas-ms-v2-mediasoup
+    environment:
+      # Integration layer uses a single operator-facing host-IP knob:
+      # HOST_IP in the .env. VAS's mediasoup-server reads
+      # MEDIASOUP_ANNOUNCED_IP internally (its own var, unchanged
+      # in the VAS standalone path); we map HOST_IP -> that var here
+      # so the operator only sets one value.
+      MEDIASOUP_ANNOUNCED_IP: ${HOST_IP:?HOST_IP must be set in .env (host IP reachable by browser clients)}
   vas-backend:
     container_name: vas-ms-v2-backend
   vas-frontend:
