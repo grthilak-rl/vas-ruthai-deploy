@@ -1,0 +1,40 @@
+# Merged VAS + Ruth AI — NVIDIA NVENC GPU overlay for VAS backend.
+#
+# Layered on top of docker-compose.yml when running VAS with the
+# NVENC encoder on an NVIDIA GPU. This is the integration-side
+# equivalent of vas-ms-v2/deploy/docker-compose.gpu.yml; we cannot
+# `include:` that file here (`include:` doesn't chain), so the
+# vas-backend GPU bits are restated below.
+#
+# Operator usage (project server / GPU mode):
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# CPU mode (MCU appliance / no GPU for VAS):
+#   docker compose up -d
+# and set VAS_VIDEO_CODEC=libx264 in .env.
+#
+# Note on GPU allocation:
+#   - VAS encoder (this overlay) uses NVENC_GPU_INDEX (default 1)
+#   - Ruth's unified-ai-runtime uses GPU 0 (declared in the base
+#     docker-compose.yml; left in place because Ruth's models always
+#     need a GPU and don't have a CPU fallback path)
+#   For a single-GPU host: drop the unified-ai-runtime GPU
+#   reservation (a separate concern, not this overlay's job) OR
+#   keep both on GPU 0 by setting NVENC_GPU_INDEX=0 here.
+
+services:
+  vas-backend:
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${NVENC_GPU_INDEX:-1}"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"
+      # When the GPU overlay is in play, default the encoder to
+      # NVENC. Operator can still override via VAS_VIDEO_CODEC.
+      VAS_VIDEO_CODEC: "${VAS_VIDEO_CODEC:-h264_nvenc}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${NVENC_GPU_INDEX:-1}"]
+              capabilities: [gpu, video]
