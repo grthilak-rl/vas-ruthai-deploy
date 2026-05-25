@@ -217,7 +217,12 @@ services:
     container_name: ruth-ai-vas-frontend
     restart: unless-stopped
     ports:
-      - "3300:80"
+      # Host port is operator-configurable via RUTH_FRONTEND_HOST_PORT;
+      # default 80 gives a clean customer-facing URL (no :port suffix)
+      # on appliances like the MCU. Operators can override (e.g. 3300)
+      # if port 80 is already taken on the host. Container always
+      # listens on 80 internally — see frontend/Dockerfile.
+      - "${RUTH_FRONTEND_HOST_PORT:-80}:80"
     environment:
       VAS_PROXY_URL: http://host.docker.internal:${VAS_BACKEND_PORT:-8085}
       VITE_API_BASE_URL: http://localhost:8080
