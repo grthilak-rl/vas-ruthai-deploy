@@ -181,13 +181,50 @@ you have a reason to change it.
 | `RUTH_JWT_SECRET` | JWT signing key for Ruth's API tokens. | `openssl rand -hex 32` |
 | `VAS_CLIENT_SECRET` | **The VAS↔Ruth credential contract.** Set ONCE here. VAS seeds the `ruth-ai-backend` OAuth client with it at startup; Ruth authenticates to VAS with it. No manual API call needed. | `openssl rand -hex 32` |
 
-### One default worth knowing
+### The two URLs operators use
 
-- **`RUTH_FRONTEND_HOST_PORT=80`** — Ruth's frontend is exposed on
-  host port 80 by default (clean customer-facing URL). If port 80 is
-  already in use on the host, set this to something ≥ 1024 (e.g.
-  `3300`). On rootless Docker, port 80 needs
-  `sysctl net.ipv4.ip_unprivileged_port_start=80` or a value ≥ 1024.
+The integrated deployment exposes two documented URLs, both on
+fixed env-pinned ports:
+
+| URL | Purpose | Port variable |
+|---|---|---|
+| `http://<HOST_IP>/` | **Ruth portal** — customer-facing app (live monitoring, alerts, etc.) | `RUTH_FRONTEND_HOST_PORT=80` |
+| `http://<HOST_IP>:8086/` | **VAS admin** — camera management, RTSP onboarding, stream control | `VAS_HTTP_PORT=8086` |
+
+Operators learn both. Ruth is where day-to-day work happens; VAS
+is where cameras get added and configured. No single-entry-point
+proxy — the two-URL contract is simpler and the only thing
+operators have to remember.
+
+The VAS admin URL is served by `vas-nginx`, VAS's edge proxy. It
+fronts the SPA, the HTTP API (`/api/`, `/v1/`, `/v2/`), the
+MediaSoup signaling WebSocket (`/ws/`), and HLS segment serving
+(`/static/hot/`) on one origin — the same shape VAS standalone
+uses. The SPA's same-origin calls (API + WebSocket) depend on this
+edge; running vas-frontend without it leaves the SPA unable to
+reach the API or open the signaling WebSocket.
+
+vas-nginx in this integrated deployment listens **only** on
+`${VAS_HTTP_PORT:-8086}`. The stock `nginx:alpine` image ships a
+default `listen 80;` config block that we suppress (mounted-empty)
+so it never tries to take host port 80, which Ruth owns. See
+`nginx/empty.conf` in this repo.
+
+### Picking values worth knowing
+
+- **`RUTH_FRONTEND_HOST_PORT=80`** — Ruth's portal port. If
+  something else on the host is already on :80, set this to
+  something ≥ 1024 (e.g. `3300`). On rootless Docker, port 80
+  needs `sysctl net.ipv4.ip_unprivileged_port_start=80` or a value
+  ≥ 1024.
+- **`VAS_HTTP_PORT=8086`** — VAS admin port (the vas-nginx edge).
+  Change only if it collides.
+- **`HOST_IP`** — required for WebRTC ICE; baked into Ruth's
+  frontend bundle as `VITE_VAS_WEBRTC_URL`. VAS's frontend in the
+  integrated deployment does *not* bake `HOST_IP` (it resolves the
+  API base from `window.location.origin` at runtime via
+  vas-nginx). See "Changing HOST_IP after deployment" in
+  troubleshooting.
 
 **Do not** set `VAS_VIDEO_CODEC` in `.env`. The compose mode
 decides — base compose picks `libx264`, the GPU overlay picks
@@ -237,7 +274,7 @@ from it at startup, so VAS needs to be healthy before Ruth starts.
 ```bash
 cd /opt/ruthai/vas-ruthai-deploy
 
-# Pick ONE of these two depending on your mode (see section 6):
+# Pick ONE of these two depending on your mode (see section 6).
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d \
   vas-db vas-redis vas-mediasoup vas-backend vas-frontend vas-nginx
 # OR for CPU mode:
@@ -268,7 +305,7 @@ curl http://localhost:${VAS_BACKEND_PORT:-8085}/health
 ```
 
 A fresh VAS has zero cameras — that's expected. You'll add them in
-section 8.
+section 8 — through Ruth's portal, or directly via the VAS API.
 
 ### 7b. Bring up Ruth AI + the AI runtime
 
@@ -325,15 +362,15 @@ also does the single-command bring-up after generating `.env`.
 
 ## 8. Adding cameras
 
-A fresh VAS has no cameras. Add them through VAS, not through Ruth.
-Ruth auto-syncs from VAS at startup and on demand.
+A fresh VAS has no cameras. Add them through the VAS admin portal
+(or its API). Ruth auto-syncs from VAS at startup and on demand.
 
 ### Through the VAS portal (recommended)
 
-1. Open the VAS portal: `http://<HOST_IP>:${VAS_HTTP_PORT:-8086}`.
+1. Open the VAS portal:
+   `http://<HOST_IP>:${VAS_HTTP_PORT:-8086}/`.
 2. Navigate to the **Devices** page.
-3. Add a camera: provide a name and the RTSP URL
-   (`rtsp://user:pass@ip[:port]/path`).
+3. Add a camera: name + RTSP URL (`rtsp://user:pass@ip[:port]/path`).
 4. Start the stream from the Devices page; confirm it appears LIVE.
 
 ### Through the VAS API
@@ -349,6 +386,7 @@ curl -X POST "http://<HOST_IP>:${VAS_BACKEND_PORT:-8085}/api/v1/devices" \
 
 The legacy `/api/v1/devices/*` endpoints do not require auth. The
 newer `/v2/*` endpoints require an OAuth Bearer token.
+
 **VERIFY DURING DEPLOYMENT:** the exact UI flow on the current
 VAS frontend, including whether "Start streaming" must be clicked
 manually after creating a device.
@@ -393,11 +431,22 @@ should pass before you call the deployment done.
   healthy. With weights present, **VERIFY DURING DEPLOYMENT** that
   the per-model health endpoints (`/models/status` or equivalent
   on Ruth's backend) report fall/ppe/geo loaded.
-- [ ] **VAS portal loads** at
-  `http://<HOST_IP>:${VAS_HTTP_PORT:-8086}/`.
 - [ ] **Ruth portal loads** at
   `http://<HOST_IP>:${RUTH_FRONTEND_HOST_PORT:-80}/`. (If port 80,
   the URL has no `:port` suffix.)
+- [ ] **VAS admin portal works end-to-end** at
+  `http://<HOST_IP>:${VAS_HTTP_PORT:-8086}/`. "Loads" is not
+  enough — open the Streams or Devices page and confirm in the
+  browser DevTools:
+  - No `Failed to discover streams: Request timeout` in the
+    console.
+  - No `WebSocket connection timeout` /
+    `getRouterRtpCapabilities` timeout from mediasoup-client.
+  - Camera feeds actually start and render (assuming at least one
+    camera is configured and live).
+  These three pass when vas-nginx is correctly fronting the SPA's
+  same-origin API + `/ws/` routes. If any fail, see
+  troubleshooting → "VAS UI loads but feeds time out".
 - [ ] **Live Camera Monitoring** — open Ruth → Camera Monitoring
   → select a camera. WebRTC connects and live video plays. Enable
   fall/PPE/tank — overlays draw on the frame.
@@ -434,10 +483,41 @@ the overlay (section 6).
 
 ### Port 80 already in use / `docker compose up` fails with port bind error
 
-Something else (nginx on the host, Apache, etc.) is already on
-port 80. Either stop the other service, or set
-`RUTH_FRONTEND_HOST_PORT=3300` (or any free port ≥ 1024) in `.env`
-and re-up.
+Something else on the host is already on port 80. The integrated
+deployment is designed so vas-nginx listens **only** on
+`${VAS_HTTP_PORT:-8086}` (via the empty `nginx/empty.conf` mounted
+over the stock `default.conf`), so vas-nginx should not contest
+:80. If it does, the `nginx/empty.conf` mount is missing or has
+been undone — check `docker compose config` output for the
+`/etc/nginx/conf.d/default.conf` mount on `vas-nginx`.
+
+If a host-level nginx, Apache, or unrelated container owns :80,
+either stop it or set `RUTH_FRONTEND_HOST_PORT=3300` (or any free
+port ≥ 1024) in `.env` and re-up.
+
+### VAS UI loads but feeds time out / "Request timeout" / "WebSocket connection timeout"
+
+This is the failure mode when vas-nginx is missing or not
+fronting the SPA. The VAS SPA assumes same-origin routing for its
+HTTP API and the MediaSoup signaling WebSocket; without
+vas-nginx the SPA's calls to `/api/v1/*` and the `/ws/...`
+handshake go to the Next.js server, which doesn't proxy them.
+
+Check:
+
+```bash
+docker compose ps vas-nginx                              # Up (healthy)?
+curl -I http://<HOST_IP>:${VAS_HTTP_PORT:-8086}/         # 200?
+curl -I -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" \
+  -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  http://<HOST_IP>:${VAS_HTTP_PORT:-8086}/ws/mediasoup   # 101 Switching Protocols?
+```
+
+If the WebSocket check doesn't get a `101`, vas-nginx is either
+not running or its `/ws/` location block isn't loaded — restart it
+and confirm `/etc/nginx/conf.d/vas.conf` was generated correctly
+from the template.
 
 ### Ruth runtime starts but every frame returns 0 detections
 
@@ -478,10 +558,9 @@ below).
 ### Changing HOST_IP after deployment
 
 **Known limitation.** Ruth's frontend bakes `VITE_VAS_WEBRTC_URL`
-into its built JS bundle at Docker build time (Vite is a build-time
-templating tool). Changing `HOST_IP` in `.env` and restarting the
-frontend container is NOT enough — the old IP is still in the JS
-the browser downloads.
+into its JS bundle at Docker build time. Changing `HOST_IP` in
+`.env` and restarting the frontend container is NOT enough — the
+old IP is still in the JS the browser downloads.
 
 To pick up a new `HOST_IP`:
 
@@ -490,9 +569,13 @@ docker compose build ruth-ai-frontend
 docker compose up -d ruth-ai-frontend
 ```
 
-VAS's mediasoup container does read `HOST_IP` at runtime (via the
-`MEDIASOUP_ANNOUNCED_IP` mapping in compose), so a plain restart
-suffices for that side:
+VAS's frontend does NOT need a rebuild — in the integrated
+deployment it resolves its API base from `window.location.origin`
+at runtime via vas-nginx, so it follows whatever host the operator
+loads it from.
+
+VAS's mediasoup container reads `HOST_IP` at runtime (via
+`MEDIASOUP_ANNOUNCED_IP`), so a plain restart suffices:
 
 ```bash
 docker compose restart vas-mediasoup
@@ -512,10 +595,26 @@ docker compose restart vas-mediasoup
 | Stop everything | `docker compose down` |
 | Stop and wipe Ruth data (dangerous) | `docker compose down -v` (this destroys *both* product databases) |
 
-| Endpoint | URL |
-|---|---|
-| VAS portal | `http://<HOST_IP>:${VAS_HTTP_PORT:-8086}/` |
-| Ruth portal | `http://<HOST_IP>:${RUTH_FRONTEND_HOST_PORT:-80}/` |
-| VAS health | `http://<HOST_IP>:${VAS_BACKEND_PORT:-8085}/health` |
-| Ruth health | `http://localhost:8090/api/v1/health` |
-| Unified AI runtime health | `http://localhost:8012/health` |
+| Endpoint | URL | Port var |
+|---|---|---|
+| Ruth portal | `http://<HOST_IP>/` (if port 80, no `:port`) | `RUTH_FRONTEND_HOST_PORT=80` |
+| VAS admin portal | `http://<HOST_IP>:8086/` | `VAS_HTTP_PORT=8086` |
+| VAS health | `http://<HOST_IP>:8086/health` (via vas-nginx) | `VAS_HTTP_PORT=8086` |
+| Ruth health | `http://<HOST_IP>:8090/api/v1/health` | `RUTH_BACKEND_HOST_PORT=8090` |
+| Unified AI runtime health | `http://<HOST_IP>:8012/health` | `RUTH_UNIFIED_RUNTIME_HOST_PORT=8012` |
+
+### Full host-port map
+
+| Service | Host port | Variable | Notes |
+|---|---|---|---|
+| Ruth frontend | 80 | `RUTH_FRONTEND_HOST_PORT` | Operator-facing |
+| Ruth backend | 8090 | `RUTH_BACKEND_HOST_PORT` | |
+| Unified AI runtime | 8012 | `RUTH_UNIFIED_RUNTIME_HOST_PORT` | |
+| Ruth Postgres | 5434 | `RUTH_DB_HOST_PORT` | |
+| Ruth Redis | 6382 | `RUTH_REDIS_HOST_PORT` | |
+| VAS edge (vas-nginx) | 8086 | `VAS_HTTP_PORT` | Operator-facing; fronts SPA + API + `/ws/` + HLS |
+| VAS frontend | 127.0.0.1:3200 | `VAS_FRONTEND_HOST_PORT` | Loopback only; behind vas-nginx |
+| VAS backend | 8085 | `VAS_BACKEND_PORT` | Host network |
+| VAS Postgres | 5433 | `VAS_DB_HOST_PORT` | |
+| VAS Redis | 6380 | `VAS_REDIS_HOST_PORT` | |
+| MediaSoup WebRTC | 3001 + 20000-20999 RTC | `MEDIASOUP_PORT`, `MEDIASOUP_RTC_MIN_PORT/MAX_PORT` | Host network |

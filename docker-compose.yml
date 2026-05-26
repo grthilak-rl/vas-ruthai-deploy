@@ -66,8 +66,31 @@ services:
       VAS_RUTH_CLIENT_SECRET: ${VAS_CLIENT_SECRET:?VAS_CLIENT_SECRET must be set in .env (VAS<->Ruth contract)}
   vas-frontend:
     container_name: vas-ms-v2-frontend
+    # vas-frontend sits behind vas-nginx (the VAS edge proxy, below)
+    # — exactly as it does in VAS standalone. The included compose
+    # already binds it to 127.0.0.1:${VAS_FRONTEND_HOST_PORT}; no
+    # override needed. Operators reach VAS through vas-nginx on
+    # ${VAS_HTTP_PORT}, which fronts the SPA, the API, the MediaSoup
+    # signaling WebSocket (/ws/), and HLS (/static/hot/) on one
+    # origin — same shape as standalone.
   vas-nginx:
     container_name: vas-ms-v2-nginx
+    # VAS's edge proxy. Re-enabled in the integrated deployment
+    # because vas-frontend's SPA assumes same-origin routing for
+    # API calls AND the MediaSoup signaling WebSocket — without
+    # vas-nginx, /ws/signaling has no working route and feeds
+    # don't start.
+    #
+    # vas-nginx runs network_mode: host. Its templated server block
+    # listens on ${VAS_HTTP_PORT:-8086}, not 80 — but the stock
+    # nginx:alpine image ships /etc/nginx/conf.d/default.conf with
+    # a `listen 80;` block that we MUST suppress, or it tries to
+    # bind host :80 (which Ruth owns) on startup. We mask it by
+    # bind-mounting an empty file over it. The container's own
+    # /etc/nginx/templates/vas.conf.template is unaffected and
+    # still produces /etc/nginx/conf.d/vas.conf at startup.
+    volumes:
+      - ./nginx/empty.conf:/etc/nginx/conf.d/default.conf:ro
 
   # ──────────────────────────────────────────────────────────────────────
   # Ruth AI services
@@ -86,7 +109,7 @@ services:
       POSTGRES_PASSWORD: ${RUTH_POSTGRES_PASSWORD:?RUTH_POSTGRES_PASSWORD must be set in .env}
       POSTGRES_DB: ${RUTH_POSTGRES_DB:-ruth_ai}
     ports:
-      - "5434:5432"
+      - "${RUTH_DB_HOST_PORT:-5434}:5432"
     volumes:
       - ruth-postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -103,7 +126,7 @@ services:
     container_name: ruth-ai-vas-redis
     restart: unless-stopped
     ports:
-      - "6382:6379"
+      - "${RUTH_REDIS_HOST_PORT:-6382}:6379"
     volumes:
       - ruth-redis-data:/data
     command: redis-server --appendonly yes
@@ -123,7 +146,7 @@ services:
     container_name: ruth-ai-vas-backend
     restart: unless-stopped
     ports:
-      - "8090:8080"
+      - "${RUTH_BACKEND_HOST_PORT:-8090}:8080"
     environment:
       RUTH_AI_ENV: ${RUTH_AI_ENV:-development}
       RUTH_AI_LOG_LEVEL: ${RUTH_AI_LOG_LEVEL:-info}
@@ -182,7 +205,7 @@ services:
     container_name: ruth-ai-unified-runtime
     restart: unless-stopped
     ports:
-      - "8012:8000"
+      - "${RUTH_UNIFIED_RUNTIME_HOST_PORT:-8012}:8000"
     volumes:
       - ../ruth-ai-vas-ms-v2/ai/models:/app/ai/models:ro
     environment:
