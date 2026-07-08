@@ -31,6 +31,11 @@ services:
       # When the GPU overlay is in play, default the encoder to
       # NVENC. Operator can still override via VAS_VIDEO_CODEC.
       VAS_VIDEO_CODEC: "${VAS_VIDEO_CODEC:-h264_nvenc}"
+      # Bookmark clip encoder — same story as VAS_VIDEO_CODEC. Overrides
+      # the base compose's libx264 default so the GPU flavour uses NVENC.
+      # vas-backend gets GPU access below (runtime: nvidia + device
+      # reservation), so h264_nvenc can actually load CUDA here.
+      BOOKMARK_VIDEO_CODEC: "${BOOKMARK_VIDEO_CODEC:-h264_nvenc}"
     deploy:
       resources:
         reservations:

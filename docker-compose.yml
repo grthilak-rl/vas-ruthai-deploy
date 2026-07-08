@@ -64,6 +64,12 @@ services:
       # VAS standalone leaves VAS_RUTH_CLIENT_SECRET unset and skips
       # the seeding entirely (no-op, single info log line).
       VAS_RUTH_CLIENT_SECRET: ${VAS_CLIENT_SECRET:?VAS_CLIENT_SECRET must be set in .env (VAS<->Ruth contract)}
+      # Bookmark clip encoder. Base compose is the CPU flavour, so default
+      # to libx264 (no GPU needed). The GPU overlay (docker-compose.gpu.yml)
+      # overrides this to h264_nvenc for the GPU flavour. Without this,
+      # code defaults to h264_nvenc (bookmarks.py:197) and CPU-only boxes
+      # fail every bookmark encode with "Cannot load libcuda.so.1".
+      BOOKMARK_VIDEO_CODEC: "${BOOKMARK_VIDEO_CODEC:-libx264}"
   vas-frontend:
     container_name: vas-ms-v2-frontend
     # vas-frontend sits behind vas-nginx (the VAS edge proxy, below)
