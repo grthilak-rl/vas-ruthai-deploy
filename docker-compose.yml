@@ -54,6 +54,13 @@ services:
       MEDIASOUP_ANNOUNCED_IP: ${HOST_IP:?HOST_IP must be set in .env (host IP reachable by browser clients)}
   vas-backend:
     container_name: vas-ms-v2-backend
+    # The AI frame tap writes one JPEG per live stream to /dev/shm (see
+    # rtsp_pipeline Output 3). Actual use is tiny — `-update 1` overwrites a
+    # single file per stream, so ~2x 250KB per camera including the atomic
+    # temp file, a few MB at any realistic camera count. The headroom matters
+    # because a full tmpfs would fail ffmpeg's write and take down the whole
+    # process, live WebRTC feed included; 256m removes that as a concern.
+    shm_size: "256m"
     environment:
       # VAS<->Ruth credential contract. The operator sets a single
       # VAS_CLIENT_SECRET in the integration .env; compose maps it
