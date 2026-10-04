@@ -210,6 +210,11 @@ services:
       - ruth-ai-internal
 
   unified-ai-runtime:
+    # Fixed image name: `docker compose up -d` reuses this tag when it exists
+    # locally and does NOT rebuild. Rebuild only deliberately, with
+    # `docker compose build unified-ai-runtime`. Deps are pinned via
+    # ai/requirements-gpu.txt + ai/constraints-gpu.txt.
+    image: ruth-ai-unified-runtime:2026.10-pinned
     build:
       context: ../ruth-ai-vas-ms-v2/ai
       dockerfile: Dockerfile
@@ -231,6 +236,7 @@ services:
       - BACKEND_URL=http://ruth-ai-vas-backend:8080
       - BACKEND_INTEGRATION_ENABLED=true
       - BACKEND_HEALTH_PUSH_INTERVAL_SECONDS=30
+      - YOLO_AUTOINSTALL=False
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
