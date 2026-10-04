@@ -199,6 +199,11 @@ services:
       UNIFIED_RUNTIME_URL: http://unified-ai-runtime:8000
       UNIFIED_RUNTIME_ENABLE: "true"
       UNIFIED_RUNTIME_TIMEOUT: ${UNIFIED_RUNTIME_TIMEOUT:-30.0}
+      # Uploaded models (model store) run in model-store-runtime. Empty = off:
+      # every model goes to unified-ai-runtime, exactly as before. To enable,
+      # set MODEL_STORE_RUNTIME_URL=http://model-store-runtime:8000 in .env.
+      MODEL_STORE_RUNTIME_URL: ${MODEL_STORE_RUNTIME_URL:-}
+      MODEL_STORE_RUNTIME_ID: model-store-runtime
       # Model Management store (admin uploads). Missing or not writable by
       # appuser (uid 1000) = model-store API returns 503; nothing else changes.
       MODEL_STORE_ROOT: /store
@@ -262,6 +267,58 @@ services:
           memory: 4G
         reservations:
           memory: 2G
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  # Second runtime for uploaded models (Model Management store). Same pinned
+  # image and code as unified-ai-runtime; it only reads the models installed
+  # under <store>/enabled/ (ai/store_plugin/install_enabled.py). Restarting it
+  # ("Apply") affects only cameras running uploaded models.
+  # Opt-in profile: plain `docker compose up -d` does not start it.
+  #   docker compose --profile model-store up -d model-store-runtime
+  model-store-runtime:
+    image: ruth-ai-unified-runtime:2026.10-pinned
+    container_name: ruth-ai-model-store-runtime
+    profiles: ["model-store"]
+    restart: unless-stopped
+    # The store is owned by uid 1000 (750/640); the image's default user
+    # (ruth, uid 999) could not read it and would load nothing.
+    user: "1000:1000"
+    # No host port: only the backend talks to it, on ruth-ai-internal.
+    volumes:
+      - ${RUTH_MODEL_STORE_HOST_DIR:-/mnt/storage/ruth-models}/enabled:/store-models:ro
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=info
+      - MODELS_ROOT=/store-models
+      # Fixed id: the backend excludes it from system AI health, and restarts
+      # don't leave stale random registrations behind.
+      - RUNTIME_ID=model-store-runtime
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+      - BACKEND_URL=http://ruth-ai-vas-backend:8080
+      - BACKEND_INTEGRATION_ENABLED=true
+      - BACKEND_HEALTH_PUSH_INTERVAL_SECONDS=30
+      - YOLO_AUTOINSTALL=False
+      # uid 1000 has no home dir in the image; keep ultralytics' settings in /tmp.
+      - YOLO_CONFIG_DIR=/tmp/ultralytics
+    healthcheck:
+      # /health answers 200 even with no models loaded (an empty store is fine).
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    networks:
+      - ruth-ai-internal
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
           devices:
             - driver: nvidia
               device_ids: ["0"]
