@@ -199,6 +199,11 @@ services:
       UNIFIED_RUNTIME_URL: http://unified-ai-runtime:8000
       UNIFIED_RUNTIME_ENABLE: "true"
       UNIFIED_RUNTIME_TIMEOUT: ${UNIFIED_RUNTIME_TIMEOUT:-30.0}
+      # Model Management store (admin uploads). Missing or not writable by
+      # appuser (uid 1000) = model-store API returns 503; nothing else changes.
+      MODEL_STORE_ROOT: /store
+    volumes:
+      - ${RUTH_MODEL_STORE_HOST_DIR:-/mnt/storage/ruth-models}:/store
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
