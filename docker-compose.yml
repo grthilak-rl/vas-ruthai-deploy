@@ -182,6 +182,12 @@ services:
       JWT_SECRET_KEY: ${RUTH_JWT_SECRET:?RUTH_JWT_SECRET must be set in .env}
       JWT_ALGORITHM: HS256
       JWT_EXPIRY_MINUTES: 60
+      # Admin login for the Model Management page (/api/v1/admin only).
+      # Unset = admin API returns 503; nothing else is affected.
+      RUTH_ADMIN_USERNAME: ${RUTH_ADMIN_USERNAME:-}
+      RUTH_ADMIN_PASSWORD_HASH: ${RUTH_ADMIN_PASSWORD_HASH:-}
+      # nginx (frontend container) sets X-Real-IP; trust it only from there.
+      RUTH_ADMIN_TRUSTED_PROXY_HOSTS: ruth-ai-vas-frontend
       # NLP Chat is intentionally disabled in this deploy (GPU 1 reassigned
       # to vas-backend nvenc). Setting NLP_CHAT_ENABLED=false makes Ruth
       # skip the startup connect, return "disabled" from the health check,
