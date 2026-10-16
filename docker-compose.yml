@@ -207,8 +207,15 @@ services:
       # Model Management store (admin uploads). Missing or not writable by
       # appuser (uid 1000) = model-store API returns 503; nothing else changes.
       MODEL_STORE_ROOT: /store
+      # Pre-archive backups for "Start new project". Missing or not writable
+      # by appuser (uid 1000) = that one admin action refuses with 503;
+      # nothing else is affected. A bind mount rather than a named volume so
+      # the dumps are reachable from the host for off-box copying, and so
+      # they survive `docker compose down -v`.
+      PROJECT_BACKUP_DIR: /var/backups/ruth-ai
     volumes:
       - ${RUTH_MODEL_STORE_HOST_DIR:-/mnt/storage/ruth-models}:/store
+      - ${RUTH_BACKUP_HOST_DIR:-/mnt/storage/ruth-backups}:/var/backups/ruth-ai
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

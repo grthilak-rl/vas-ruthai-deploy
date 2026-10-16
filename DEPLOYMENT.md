@@ -38,6 +38,33 @@ find ../ruth-ai-vas-ms-v2/ai -name "*.pt" | wc -l
 (Skip only if you just want the `tank_overflow_monitoring` demo — it needs
 no weights. All other models return zero detections without them.)
 
+### 2b. Create the host storage directories (uid 1000)
+
+Both are bind-mounted into the Ruth backend, which runs as `appuser`
+(uid 1000). Each failure is contained to one feature rather than the
+stack — but both fail *silently from the outside*, so create them up front.
+
+```bash
+sudo mkdir -p /mnt/storage/ruth-models /mnt/storage/ruth-backups
+sudo chown 1000:1000 /mnt/storage/ruth-models /mnt/storage/ruth-backups
+
+# Verify as the container sees them (expect "writable" twice):
+docker run --rm -u 1000:1000 \
+  -v /mnt/storage/ruth-models:/store \
+  -v /mnt/storage/ruth-backups:/var/backups/ruth-ai \
+  alpine sh -c 'test -w /store && echo "store writable";
+                test -w /var/backups/ruth-ai && echo "backups writable"'
+```
+
+| Directory | Mounted at | If missing / not writable |
+|---|---|---|
+`/mnt/storage/ruth-models` | `/store` | Model Management API returns 503 |
+`/mnt/storage/ruth-backups` | `/var/backups/ruth-ai` | "Start new project" refuses (it will not archive without a verified `pg_dump`) |
+
+Override either with `RUTH_MODEL_STORE_HOST_DIR` / `RUTH_BACKUP_HOST_DIR`
+in `.env`. Backup dumps are ~30 MB each and are **never pruned
+automatically** — rotate them off-box.
+
 ### 3. Create `.env` — set the IP, auto-fill the 6 secrets
 
 ```bash
