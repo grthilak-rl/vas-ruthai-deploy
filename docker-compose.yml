@@ -204,6 +204,20 @@ services:
       # set MODEL_STORE_RUNTIME_URL=http://model-store-runtime:8000 in .env.
       MODEL_STORE_RUNTIME_URL: ${MODEL_STORE_RUNTIME_URL:-}
       MODEL_STORE_RUNTIME_ID: model-store-runtime
+      # RUTH_STORE_INFERENCE_CONCURRENCY — uploaded models' own in-flight
+      # budget (default 2 in code; built-in models use
+      # RUTH_INFERENCE_CONCURRENCY, also 2). Deliberately NOT set.
+      #
+      # Measured 2026-10-17 after the store runtime's offload flag went on:
+      # the existing budget of 2 is occupied only 33% of the time and mean
+      # concurrency is 1.02, so the backend is not blocking on it. At 65ms
+      # mean latency two slots could serve ~30 req/s; it is serving 16.
+      # The limiter is upstream — InferenceBudget's pacing
+      # (RUTH_INFERENCE_TARGET_FPS 2.0, RUTH_INFERENCE_MIN_FPS 0.2,
+      # RUTH_INFERENCE_MAX_GPU_UTIL 2.3). Raising this alone widens a door
+      # that is already ajar.
+      #
+      # Raise it only together with the pacer, and measure both. See BL-5.
       # Model Management store (admin uploads). Missing or not writable by
       # appuser (uid 1000) = model-store API returns 503; nothing else changes.
       MODEL_STORE_ROOT: /store
@@ -279,14 +293,21 @@ services:
               device_ids: ["0"]
               capabilities: [gpu]
 
-  # Second runtime for uploaded models (Model Management store). Same pinned
-  # image and code as unified-ai-runtime; it only reads the models installed
-  # under <store>/enabled/ (ai/store_plugin/install_enabled.py). Restarting it
+  # Second runtime for uploaded models (Model Management store). Same code as
+  # unified-ai-runtime; it only reads the models installed under
+  # <store>/enabled/ (ai/store_plugin/install_enabled.py). Restarting it
   # ("Apply") affects only cameras running uploaded models.
   # Opt-in profile: plain `docker compose up -d` does not start it.
   #   docker compose --profile model-store up -d model-store-runtime
+  #
+  # Deliberately on a DIFFERENT image tag from unified-ai-runtime, which
+  # stays on 2026.10-pinned. 2026.10-offload carries the BL-5 thread
+  # hand-off; enabling it here only means the built-in runtime's path is
+  # untouched in both code and configuration, so a regression can only
+  # reach the three uploaded PPE models. Roll back by restoring
+  # 2026.10-pinned and dropping RUTH_RUNTIME_OFFLOAD_INFERENCE below.
   model-store-runtime:
-    image: ruth-ai-unified-runtime:2026.10-pinned
+    image: ruth-ai-unified-runtime:2026.10-offload
     container_name: ruth-ai-model-store-runtime
     profiles: ["model-store"]
     restart: unless-stopped
@@ -311,6 +332,18 @@ services:
       - YOLO_AUTOINSTALL=False
       # uid 1000 has no home dir in the image; keep ultralytics' settings in /tmp.
       - YOLO_CONFIG_DIR=/tmp/ultralytics
+      # BL-5: await sandbox_manager.execute() on a worker thread instead of
+      # calling it inline, so the event loop can accept another request
+      # while one is on the GPU. Without this the runtime serves exactly
+      # one inference at a time across every camera and model (measured
+      # 2026-10-17: max concurrency 1 over 8,141 spans, GPU at 29%).
+      #
+      # Set ONLY here. The same image code powers unified-ai-runtime,
+      # where the flag is absent and the original inline call runs.
+      # Thread safety was verified offline first: 480 concurrent calls per
+      # model against a shared YOLO instance, zero divergence from serial
+      # ground truth, so no per-model lock is needed.
+      - RUTH_RUNTIME_OFFLOAD_INFERENCE=true
     healthcheck:
       # /health answers 200 even with no models loaded (an empty store is fine).
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
