@@ -26,6 +26,32 @@
 include:
   - ../vas-ms-v2/deploy/docker-compose.yml
 
+# Log rotation for every service. Without it json-file grows without
+# bound: the store runtime had reached 872 MB of inference lines on a
+# disk already at 85%. 50m x 5 caps each container at 250 MB.
+#
+# How much history that buys depends entirely on the service. Quiet ones
+# keep months. The store runtime at 12 cameras x 4 models writes ~38
+# lines/s (~43 MB/h) while models are in trial mode, so 250 MB is only
+# about SIX HOURS. If a trial needs a longer look-back than that, either
+# raise its cap here or archive the window first — see
+# /mnt/storage/ruth-models/eval/2026-10-18/trial-logs/.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+# While models are in trial mode the store runtime writes ~43 MB/h, so the
+# default 250 MB is only about six hours. 200m x 10 = 2 GB keeps roughly
+# two days, long enough to look back over a trial. Drop this override once
+# the trial blocks come out of the manifests.
+x-logging-store-runtime: &store-runtime-logging
+  driver: json-file
+  options:
+    max-size: "200m"
+    max-file: "10"
+
 services:
 
   # ──────────────────────────────────────────────────────────────────────
@@ -36,14 +62,17 @@ services:
   # ${COMPOSE_PROJECT_NAME}; the merged stack overrides that here.
   # ──────────────────────────────────────────────────────────────────────
   vas-db:
+    logging: *default-logging
     container_name: vas-ms-v2-db
     volumes:
       - vas-ms-v2-postgres-data:/var/lib/postgresql/data
   vas-redis:
+    logging: *default-logging
     container_name: vas-ms-v2-redis
     volumes:
       - vas-ms-v2-redis-data:/data
   vas-mediasoup:
+    logging: *default-logging
     container_name: vas-ms-v2-mediasoup
     environment:
       # Integration layer uses a single operator-facing host-IP knob:
@@ -53,6 +82,7 @@ services:
       # so the operator only sets one value.
       MEDIASOUP_ANNOUNCED_IP: ${HOST_IP:?HOST_IP must be set in .env (host IP reachable by browser clients)}
   vas-backend:
+    logging: *default-logging
     container_name: vas-ms-v2-backend
     # The AI frame tap writes one JPEG per live stream to /dev/shm (see
     # rtsp_pipeline Output 3). Actual use is tiny — `-update 1` overwrites a
@@ -78,6 +108,7 @@ services:
       # fail every bookmark encode with "Cannot load libcuda.so.1".
       BOOKMARK_VIDEO_CODEC: "${BOOKMARK_VIDEO_CODEC:-libx264}"
   vas-frontend:
+    logging: *default-logging
     container_name: vas-ms-v2-frontend
     # vas-frontend sits behind vas-nginx (the VAS edge proxy, below)
     # — exactly as it does in VAS standalone. The included compose
@@ -87,6 +118,7 @@ services:
     # signaling WebSocket (/ws/), and HLS (/static/hot/) on one
     # origin — same shape as standalone.
   vas-nginx:
+    logging: *default-logging
     container_name: vas-ms-v2-nginx
     # VAS's edge proxy. Re-enabled in the integrated deployment
     # because vas-frontend's SPA assumes same-origin routing for
@@ -114,6 +146,7 @@ services:
   # ──────────────────────────────────────────────────────────────────────
 
   ruth-ai-db:
+    logging: *default-logging
     image: postgres:15-alpine
     container_name: ruth-ai-vas-postgres
     restart: unless-stopped
@@ -135,6 +168,7 @@ services:
       - ruth-ai-internal
 
   ruth-ai-redis:
+    logging: *default-logging
     image: redis:7-alpine
     container_name: ruth-ai-vas-redis
     restart: unless-stopped
@@ -153,6 +187,7 @@ services:
       - ruth-ai-internal
 
   ruth-ai-backend:
+    logging: *default-logging
     build:
       context: ../ruth-ai-vas-ms-v2/ruth-ai-backend
       dockerfile: Dockerfile
@@ -247,6 +282,7 @@ services:
       - ruth-ai-internal
 
   unified-ai-runtime:
+    logging: *default-logging
     # Fixed image name: `docker compose up -d` reuses this tag when it exists
     # locally and does NOT rebuild. Rebuild only deliberately, with
     # `docker compose build unified-ai-runtime`. Deps are pinned via
@@ -307,6 +343,7 @@ services:
   # reach the three uploaded PPE models. Roll back by restoring
   # 2026.10-pinned and dropping RUTH_RUNTIME_OFFLOAD_INFERENCE below.
   model-store-runtime:
+    logging: *store-runtime-logging
     image: ruth-ai-unified-runtime:2026.10-offload
     container_name: ruth-ai-model-store-runtime
     profiles: ["model-store"]
@@ -371,6 +408,7 @@ services:
   # capacity allows.
 
   ruth-ai-frontend:
+    logging: *default-logging
     build:
       context: ../ruth-ai-vas-ms-v2/frontend
       dockerfile: Dockerfile
