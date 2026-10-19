@@ -265,6 +265,10 @@ services:
     volumes:
       - ${RUTH_MODEL_STORE_HOST_DIR:-/mnt/storage/ruth-models}:/store
       - ${RUTH_BACKUP_HOST_DIR:-/mnt/storage/ruth-backups}:/var/backups/ruth-ai
+      # The JPEG each violation was actually inferred from. Written by the
+      # backend (uid 1000) and served back by /violations/{id}/frame/image,
+      # so it has to outlive the container like any other evidence.
+      - ${RUTH_EVIDENCE_HOST_DIR:-/mnt/storage/ruth-evidence}:/evidence
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
