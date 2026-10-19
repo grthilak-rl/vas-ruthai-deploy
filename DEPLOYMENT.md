@@ -376,3 +376,38 @@ docker compose up -d ruth-ai-frontend
 VAS's frontend needs no rebuild (resolves its API base from
 `window.location.origin` at runtime via vas-nginx). VAS's mediasoup reads the
 IP at runtime, so a plain `docker compose restart vas-mediasoup` suffices there.
+
+## Storage settings that must stay off
+
+`GET/PUT /v2/storage/config` on the VAS backend. Three of these interact
+with the violation clip feature in a way that is not obvious, and the
+failure is silent.
+
+| setting | required value | why |
+|---|---|---|
+| `backup_enabled` | **false** | — |
+| `delete_after_backup` | **false** | — |
+| `scheduler_status` | **disabled** | — |
+| `hot_retention_days` | 7 (inert) | only bites if the above are enabled |
+| `snapshot_retention_days` | 365 | set 2026-10-19 |
+| `bookmark_retention_days` | 365 | set 2026-10-19 |
+
+**Leave the first three off.** The clip extractor
+(`extract_bookmark_video`) resolves recordings under the *hot* path only
+— it never reads `cold_storage_path`. Enabling backup with
+`delete_after_backup` moves segments to cold and deletes them from hot,
+at which point clips stop being cuttable beyond `hot_retention_days`
+even though the footage still exists. The request returns "recording not
+available", which looks identical to footage that was genuinely deleted.
+See BL-13 in the Ruth AI repo.
+
+With these off, nothing prunes recordings at all: clip reach is "since
+each camera started recording", which currently spans the whole project.
+Growth is ~57 GB/day across 12 cameras; `/mnt/storage` had 15 TB free on
+2026-10-19, roughly 260 days of headroom. Check capacity before changing
+anything here, and prefer raising `hot_retention_days` over enabling the
+backup job.
+
+The two retention values at 365 are deliberate: violation evidence has
+to outlive a project, and the snapshot/bookmark cleanup job is the only
+one of these that is safe to run.
