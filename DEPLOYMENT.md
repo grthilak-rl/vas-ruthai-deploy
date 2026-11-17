@@ -59,7 +59,7 @@ docker run --rm -u 1000:1000 \
 | Directory | Mounted at | If missing / not writable |
 |---|---|---|
 `/mnt/storage/ruth-models` | `/store` | Model Management API returns 503 |
-`/mnt/storage/ruth-backups` | `/var/backups/ruth-ai` | "Start new project" refuses (it will not archive without a verified `pg_dump`) |
+`/mnt/storage/ruth-backups` | `/var/backups/ruth-ai` | Start refuses (no project starts without a verified `pg_dump`) |
 
 Override either with `RUTH_MODEL_STORE_HOST_DIR` / `RUTH_BACKUP_HOST_DIR`
 in `.env`. Backup dumps are ~30 MB each and are **never pruned
@@ -411,3 +411,154 @@ backup job.
 The two retention values at 365 are deliberate: violation evidence has
 to outlive a project, and the snapshot/bookmark cleanup job is the only
 one of these that is safe to run.
+
+---
+
+## Projects as tags (migration `projects_as_tags`, 2026-11)
+
+Every violation, event, evidence row, session, report and export now carries
+`project_id`. Past projects are opened from **Settings → Project**; nothing is
+archived or deleted. The migration also **copies** the rows of the old
+"Initial data (before projects)" archive back into the live tables (the
+`*_archive` tables are left untouched; dropping them is a later release).
+
+The backend runs `alembic upgrade head` on start, so deploying = rebuild +
+restart. Rehearsed on a scratch copy of the production dump first.
+
+### Deploy
+
+```bash
+cd vas-ruthai-deploy
+TS=$(date +%Y%m%d-%H%M%S)
+
+# 1. Backups first (both databases), verified.
+docker exec ruth-ai-vas-postgres pg_dump -U ruth -d ruth_ai -Fc > /mnt/storage/ruth-backups/ruth_ai-pre-deploy-$TS.dump
+docker exec vas-ms-v2-db       pg_dump -U vas  -d vas_db  -Fc > /mnt/storage/ruth-backups/vas_db-pre-deploy-$TS.dump
+docker exec -i ruth-ai-vas-postgres pg_restore -l < /mnt/storage/ruth-backups/ruth_ai-pre-deploy-$TS.dump | grep -c "TABLE DATA"
+
+# 2. Rebuild and restart backend + frontend (the migration runs on start, ~30 s).
+docker compose build ruth-ai-backend ruth-ai-frontend
+docker compose up -d ruth-ai-backend ruth-ai-frontend
+docker logs -f ruth-ai-vas-backend 2>&1 | grep -m1 -E "projects_as_tags\] .*archived project|Error"
+
+# 3. Verify: per-project counts, version, health.
+docker exec ruth-ai-vas-postgres psql -U ruth -d ruth_ai -c \
+  "SELECT p.name, p.state, count(v.*) FROM projects p LEFT JOIN violations v ON v.project_id=p.id GROUP BY 1,2 ORDER BY min(p.started_at)"
+docker exec ruth-ai-vas-postgres psql -U ruth -d ruth_ai -Atc "SELECT version_num FROM alembic_version"   # projects_as_tags
+```
+
+### Roll back
+
+The migration refuses `alembic downgrade` (rows written or reviewed after the
+upgrade exist only in the tagged tables). Roll back by restoring the step-1
+dump and the previous images:
+
+```bash
+docker compose stop ruth-ai-backend
+docker exec ruth-ai-vas-postgres psql -U ruth -d postgres -c "DROP DATABASE ruth_ai WITH (FORCE)" -c "CREATE DATABASE ruth_ai OWNER ruth"
+docker exec -i ruth-ai-vas-postgres pg_restore -U ruth -d ruth_ai --no-owner < /mnt/storage/ruth-backups/ruth_ai-pre-deploy-$TS.dump
+# restore the previous backend source (/mnt/storage/ruth-backups/deploy-20261117/ruth-backend-src-pre-projects-tags-*.tgz) or image, then:
+docker compose up -d ruth-ai-backend ruth-ai-frontend
+```
+
+### After the deploy
+
+* **Footage deletion** is never un-paused by Stop/Resume/End/Start. Only
+  Settings → System lifts the pause.
+* Restored "Initial data" violations have no location stamp; they show the
+  camera's current area, as before. `scripts/backfill_violation_locations.py`
+  stamps them once the site confirms camera history.
+* `scripts/start_new_project.py` is retired (exits 1). Use Settings → Project.
+* The NLP chatbot must get project-scoped SQL before it is re-enabled (see the
+  notes in `docker-compose.yml`).
+
+## Project actions as background jobs (migration `project_jobs`, 2026-11)
+
+Start, Stop, End and Resume run as background jobs. The request validates and
+answers **202** with a job at once; Settings → Project shows its stages
+(backup → project → cameras for Start) and polls until it succeeds or fails.
+
+* **One at a time.** A second action answers 409 `lifecycle_busy` with the
+  running job's id (database rule plus the lifecycle lock).
+* **After a restart** a job that was running shows "interrupted". It is never
+  resumed by itself. **Retry** continues from the recorded stage: a Start
+  reuses its verified backup and never creates the project twice.
+* **Start needs cameras.** Nothing is ticked by default. Zero cameras has to be
+  confirmed explicitly ("Start with no cameras").
+* **Backups** go to `PROJECT_BACKUP_DIR`, mounted from
+  `${RUTH_BACKUP_HOST_DIR:-/mnt/storage/ruth-backups}`. With
+  `PROJECT_BACKUP_REQUIRE_MOUNT=true`, Start refuses if that path is not a
+  mount, because the dump would otherwise fill the root disk. Only the newest
+  `PROJECT_BACKUP_KEEP` (5) `project-*.dump` files are kept. Other files in the
+  folder are never touched.
+* **Deploy dumps** belong in `/mnt/storage/ruth-backups/` too, not
+  `vas-ruthai-deploy/backups/` (git-ignored, on the root disk).
+
+### Deploy
+
+Use the same steps as "Projects as tags" → Deploy: verified dumps of both
+databases to `/mnt/storage/ruth-backups/`, then rebuild and restart the
+backend and frontend. The migration only adds the `project_jobs` table.
+
+```bash
+docker exec ruth-ai-vas-postgres psql -U ruth -d ruth_ai -c "select version_num from alembic_version"   # project_jobs
+docker exec ruth-ai-vas-postgres psql -U ruth -d ruth_ai -c "\d project_jobs"
+```
+
+### Roll back
+
+```bash
+docker compose stop ruth-ai-backend
+docker compose run --rm --no-deps --entrypoint alembic ruth-ai-backend downgrade projects_as_tags   # drops project_jobs only (run with the NEW image, before retagging)
+docker tag vas-ruthai-deploy-ruth-ai-backend:pre-project-jobs  vas-ruthai-deploy-ruth-ai-backend:latest
+docker tag vas-ruthai-deploy-ruth-ai-frontend:pre-project-jobs vas-ruthai-deploy-ruth-ai-frontend:latest
+docker compose up -d --no-deps ruth-ai-backend ruth-ai-frontend
+```
+
+Do not roll back while a job is running (Settings → Project shows it).
+
+## Cameras in a project (migration `project_camera_membership`, 2026-11)
+
+* **Membership has dates.** `project_cameras` holds one row per interval
+  (`joined_at` / `left_at`). Start opens rows, End closes them, and
+  Settings → Project → "Cameras in this project" adds or removes cameras
+  mid-project as a background job, with the same preview, 409 and Retry as
+  the other actions. It runs only while the project is active.
+* **Removing a camera** disables it in VAS and closes its row. Its data and
+  history stay in the project, its inference intent is kept, and its **VAS
+  placement (location history) is never touched**.
+* **Every project action ends by refreshing Ruth's camera list** from VAS,
+  so cameras that were just switched show up correctly in Ruth.
+* **Analytics:** camera totals and the per-camera list are the project's
+  members during the period. Rates are per monitored camera-hour (inference
+  time from stream sessions): **violations per monitored camera-hour** on
+  Analytics, **incidents per monitored camera-hour** in reports. Incidents
+  group detections, so the report's rate is lower for the same hours
+  (HPCL: 7.4 violations vs 0.96 incidents over 4,640 h).
+* **Migration backfill:** existing rows get dates. HPCL and Initial data rows
+  are *inferred* from first/last activity. HPCL's 75089 and 75107 (added
+  23 Oct, never ran inference) are added as inferred members. HPCL's camera
+  count goes from 13 to 15; nothing else changes.
+
+### Deploy
+
+Same steps as before: verified dumps of both databases to
+`/mnt/storage/ruth-backups/`, tag the current images, rebuild and restart the
+backend and frontend.
+
+```bash
+docker exec ruth-ai-vas-postgres psql -U ruth -d ruth_ai -c "select version_num from alembic_version"   # project_camera_membership
+```
+
+### Roll back
+
+```bash
+docker compose stop ruth-ai-backend
+docker compose run --rm --no-deps --entrypoint alembic ruth-ai-backend downgrade project_jobs   # run with the NEW image
+docker tag vas-ruthai-deploy-ruth-ai-backend:pre-project-cameras  vas-ruthai-deploy-ruth-ai-backend:latest
+docker tag vas-ruthai-deploy-ruth-ai-frontend:pre-project-cameras vas-ruthai-deploy-ruth-ai-frontend:latest
+docker compose up -d --no-deps ruth-ai-backend ruth-ai-frontend
+```
+
+The downgrade keeps the latest interval per (project, camera) and deletes
+"cameras" job rows.
