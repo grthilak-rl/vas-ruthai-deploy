@@ -245,6 +245,9 @@ services:
       NLP_CHAT_TIMEOUT_SECONDS: ${NLP_CHAT_TIMEOUT_SECONDS:-120}
       UNIFIED_RUNTIME_URL: http://unified-ai-runtime:8000
       UNIFIED_RUNTIME_ENABLE: "true"
+      # All built-in models retired 2026-11-19 (ai/models/.disabled/): System Health
+      # shows the unified runtime "disabled". Remove with the container (BL-36).
+      UNIFIED_RUNTIME_IN_USE: "false"
       UNIFIED_RUNTIME_TIMEOUT: ${UNIFIED_RUNTIME_TIMEOUT:-30.0}
       # Uploaded models (model store) run in model-store-runtime. Empty = off:
       # every model goes to unified-ai-runtime, exactly as before. To enable,
