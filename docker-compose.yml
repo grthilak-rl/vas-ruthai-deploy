@@ -107,6 +107,11 @@ services:
       # code defaults to h264_nvenc (bookmarks.py:197) and CPU-only boxes
       # fail every bookmark encode with "Cannot load libcuda.so.1".
       BOOKMARK_VIDEO_CODEC: "${BOOKMARK_VIDEO_CODEC:-libx264}"
+      # Ruth Stream header bell: "GPU missing" / "AI Runtime down" alerts,
+      # read from Ruth's /api/v1/health. vas-backend runs on the host
+      # network, so it reaches ruth-ai-backend via its published port.
+      # Unset = VAS standalone, no AI alerts.
+      RUTH_AI_HEALTH_URL: "http://127.0.0.1:${RUTH_BACKEND_HOST_PORT:-8090}/api/v1/health"
   vas-frontend:
     logging: *default-logging
     container_name: vas-ms-v2-frontend
@@ -228,6 +233,13 @@ services:
       # skip the startup connect, return "disabled" from the health check,
       # and stop dragging overall health to "unhealthy". Restore to true
       # if/when the ruth-ai-nlp-chat + ollama services come back online.
+      # BEFORE re-enabling: the chatbot's text-to-SQL must become
+      # project-scoped. Since projects_as_tags (2026-11) every past
+      # project's rows stay in violations/events/evidence/stream_sessions,
+      # tagged with project_id; generated SQL such as
+      # "SELECT count(*) FROM violations" would count ALL projects. Add
+      # "WHERE project_id = <viewed project>" to every generated query (or
+      # give the chatbot per-project views) — see the NOTE further down.
       NLP_CHAT_ENABLED: "false"
       NLP_CHAT_SERVICE_URL: http://ruth-ai-nlp-chat:8081
       NLP_CHAT_TIMEOUT_SECONDS: ${NLP_CHAT_TIMEOUT_SECONDS:-120}
@@ -262,6 +274,10 @@ services:
       # the dumps are reachable from the host for off-box copying, and so
       # they survive `docker compose down -v`.
       PROJECT_BACKUP_DIR: /var/backups/ruth-ai
+      # Start refuses if that path is not a mount (a dump would land on the
+      # root disk and vanish on redeploy). Keep the last 5 pre-start dumps.
+      PROJECT_BACKUP_REQUIRE_MOUNT: "true"
+      PROJECT_BACKUP_KEEP: "5"
     volumes:
       - ${RUTH_MODEL_STORE_HOST_DIR:-/mnt/storage/ruth-models}:/store
       - ${RUTH_BACKUP_HOST_DIR:-/mnt/storage/ruth-backups}:/var/backups/ruth-ai
@@ -288,10 +304,12 @@ services:
   unified-ai-runtime:
     logging: *default-logging
     # Fixed image name: `docker compose up -d` reuses this tag when it exists
-    # locally and does NOT rebuild. Rebuild only deliberately, with
-    # `docker compose build unified-ai-runtime`. Deps are pinned via
+    # locally and does NOT rebuild. Rebuild only deliberately, as a NEW tag
+    # (DEPLOYMENT.md "GPU outage detection"). Deps are pinned via
     # ai/requirements-gpu.txt + ai/constraints-gpu.txt.
-    image: ruth-ai-unified-runtime:2026.10-pinned
+    # 2026.11-gpu-required: fail loudly without a GPU (GPU_FALLBACK_TO_CPU is
+    # honoured, /health reports gpu_unavailable). Rollback: 2026.10-pinned.
+    image: ruth-ai-unified-runtime:2026.11-gpu-required
     build:
       context: ../ruth-ai-vas-ms-v2/ai
       dockerfile: Dockerfile
@@ -314,6 +332,9 @@ services:
       - BACKEND_INTEGRATION_ENABLED=true
       - BACKEND_HEALTH_PUSH_INTERVAL_SECONDS=30
       - YOLO_AUTOINSTALL=False
+      # GPU required: a model that cannot get the GPU fails to load and /health
+      # reports gpu_unavailable instead of silently running on CPU (24 Aug outage).
+      - GPU_FALLBACK_TO_CPU=false
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -340,15 +361,14 @@ services:
   # Opt-in profile: plain `docker compose up -d` does not start it.
   #   docker compose --profile model-store up -d model-store-runtime
   #
-  # Deliberately on a DIFFERENT image tag from unified-ai-runtime, which
-  # stays on 2026.10-pinned. 2026.10-offload carries the BL-5 thread
-  # hand-off; enabling it here only means the built-in runtime's path is
-  # untouched in both code and configuration, so a regression can only
-  # reach the three uploaded PPE models. Roll back by restoring
-  # 2026.10-pinned and dropping RUTH_RUNTIME_OFFLOAD_INFERENCE below.
+  # Its own image tag, so it can be rolled back separately from
+  # unified-ai-runtime. 2026.11-gpu-required-offload is the same build as
+  # 2026.11-gpu-required (same code; the BL-5 thread hand-off is switched on
+  # only here, by RUTH_RUNTIME_OFFLOAD_INFERENCE below). Roll back to
+  # 2026.10-offload (the previous store image).
   model-store-runtime:
     logging: *store-runtime-logging
-    image: ruth-ai-unified-runtime:2026.10-offload
+    image: ruth-ai-unified-runtime:2026.11-gpu-required-offload
     container_name: ruth-ai-model-store-runtime
     profiles: ["model-store"]
     restart: unless-stopped
@@ -385,6 +405,8 @@ services:
       # model against a shared YOLO instance, zero divergence from serial
       # ground truth, so no per-model lock is needed.
       - RUTH_RUNTIME_OFFLOAD_INFERENCE=true
+      # GPU required; see unified-ai-runtime above.
+      - GPU_FALLBACK_TO_CPU=false
     healthcheck:
       # /health answers 200 even with no models loaded (an empty store is fine).
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -410,6 +432,17 @@ services:
   # (GPU 1 reassigned to vas-backend nvenc; ollama-dependent services
   # disabled as a result). Restore them in this file if/when GPU
   # capacity allows.
+  #
+  # PROJECT-SCOPED SQL REQUIRED before restoring them. Projects are tags
+  # (projects_as_tags migration, 2026-11): the live tables hold every
+  # project's data, each row carrying project_id. The backend scopes its
+  # own reads (app/core/project_scope.py), but the chatbot writes raw SQL
+  # (ruth-ai-nlp-chat, CHAT_ALLOWED_TABLES = devices, stream_sessions,
+  # events, violations, evidence) which that scoping cannot see. Unchanged,
+  # "how many violations?" would answer for HPCL + every later project
+  # combined. The chat service must filter every query by the project the
+  # user is viewing (pass it in the chat request; enforce it in
+  # sql_validator), or query per-project views instead of the tables.
 
   ruth-ai-frontend:
     logging: *default-logging

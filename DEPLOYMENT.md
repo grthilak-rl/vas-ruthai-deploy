@@ -233,6 +233,130 @@ streams work but burn a core per camera.
 > VAS NVENC overlay uses `NVENC_GPU_INDEX` (default **1**). On a **single-GPU
 > host**, set `NVENC_GPU_INDEX=0` in `.env` so both share GPU 0.
 
+> **CPU host:** also set `ENABLE_GPU=false` on `unified-ai-runtime`. The
+> runtimes run with `GPU_FALLBACK_TO_CPU=false`, so with the GPU still
+> expected, every model fails to load and health reports `gpu_unavailable`.
+
+## Kernel + NVIDIA driver updates (manual only)
+
+On 24 Aug, unattended-upgrades installed a new kernel without its matching
+NVIDIA module. The next boot had no GPU, and inference quietly fell back to
+CPU. Kernel and driver are now updated **only by hand, together**, using the
+steps below.
+
+What is in place on the GPU host (set up 2026-11-19):
+
+| Piece | Where | Effect |
+|---|---|---|
+| apt holds | `apt-mark showhold` | HWE kernel metapackages and the whole `*580*` driver stack are held |
+| unattended-upgrades blacklist | `/etc/apt/apt.conf.d/52gpu-stack-protection` | blocks `linux-image-/headers-/modules-/generic/hwe-`, `nvidia-`, `libnvidia-`, `docker.io`, `containerd`, `runc`. `Automatic-Reboot "false"`, `Remove-Unused-Kernel-Packages "false"`. Other security updates still install |
+| Pre-reboot guard | `/usr/local/sbin/gpu-kernel-check`, wrappers `/usr/local/sbin/{reboot,shutdown}` | `reboot`/`shutdown` refuse if the newest kernel has no NVIDIA module matching the userspace driver. Override with `GPU_GUARD_OVERRIDE=1`. Not covered: `systemctl reboot` and `/usr/sbin/reboot` |
+| Install-time warning | `/etc/kernel/postinst.d/zz-nvidia-module-check` | loud warning plus a syslog `crit` if a kernel installs without a matching module |
+| GRUB menu | `/etc/default/grub` | `GRUB_TIMEOUT_STYLE=menu`, `GRUB_TIMEOUT=5`, so the previous kernel can be picked at the console |
+
+Modules are **precompiled** (`linux-modules-nvidia-580-open-<kernel>`), not
+DKMS. A new kernel only gets a module if that package for the *same* kernel
+version is installed in the same transaction. That is the failure mode to
+watch for.
+
+Because `docker.io`, `containerd` and `runc` are blacklisted too, their
+security updates now wait for this window as well. An upgrade restarts
+dockerd and every container.
+
+### 0. Check what is pending
+
+```bash
+sudo apt update
+apt list --upgradable 2>/dev/null | grep -E '^(linux-|nvidia-|libnvidia-|docker\.io|containerd|runc)'
+apt-cache policy linux-generic-hwe-24.04 linux-modules-nvidia-580-open-generic-hwe-24.04 nvidia-driver-580-open
+```
+
+Go ahead only if the **candidate** of `linux-modules-nvidia-580-open-generic-hwe-24.04`
+has the same kernel version as `linux-generic-hwe-24.04` (e.g. both
+`7.0.0-45.45~24.04.1`; the NVIDIA one may carry a `+1` suffix). If the NVIDIA
+module for the new kernel isn't published yet, **wait**.
+
+### 1. Upgrade kernel and driver together
+
+```bash
+gpu_pkgs() {   # held set: HWE kernel metas + every installed *580* package
+  echo linux-generic-hwe-24.04 linux-image-generic-hwe-24.04 linux-headers-generic-hwe-24.04 \
+    $(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' | awk '$1 ~ /^[ih]i/ {print $2}' | sed 's/:amd64//' | grep 580)
+}
+sudo apt-mark unhold $(gpu_pkgs)
+sudo apt install linux-generic-hwe-24.04 linux-image-generic-hwe-24.04 linux-headers-generic-hwe-24.04 \
+  linux-modules-nvidia-580-open-generic-hwe-24.04 nvidia-driver-580-open
+```
+
+Read apt's plan before answering `Y`. It must list **both**
+`linux-image-<NEW>-generic` and `linux-modules-nvidia-580-open-<NEW>-generic`.
+If the second is missing, answer `n`.
+
+### 2. Check, re-hold, reboot
+
+```bash
+gpu-kernel-check                  # must print OK for the NEW kernel
+sudo apt-mark hold $(gpu_pkgs)    # re-run gpu_pkgs: it now includes the new module package
+apt-mark showhold
+sudo reboot                       # the guard refuses if gpu-kernel-check fails
+```
+
+### 3. Verify after reboot
+
+```bash
+uname -r                                             # the new kernel
+nvidia-smi                                           # RTX 3090 listed, driver version as installed
+docker exec ruth-ai-unified-runtime nvidia-smi -L    # the GPU is visible inside the runtime
+curl -s 'http://127.0.0.1:8012/health?verbose=true' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d["reasons"], d["gpu_available"]); [print(" ", m["model_id"], m["state"], m["device"]) for m in d["models"]]'
+docker exec ruth-ai-model-store-runtime curl -s 'http://localhost:8000/health' | head -c 300; echo
+curl -s http://127.0.0.1:8090/api/v1/health | python3 -c 'import json,sys; print(json.load(sys.stdin)["components"]["ai_runtime"])'
+```
+
+Expected: runtime `healthy`, `reasons: []`, `gpu_available: True`, every model
+`ready` on `cuda:0`, and the backend `ai_runtime` component `healthy`.
+
+Then confirm inference actually runs on the GPU. With a camera running a
+model, `inference_count` in the verbose health output should rise between
+two calls 30 s apart, and `nvidia-smi` should show utilisation. Ruth System
+Health shows AI Runtime green; the Ruth Stream bell shows no AI alert.
+
+### Roll back to the previous kernel
+
+The previous kernel stays installed (`Remove-Unused-Kernel-Packages "false"`).
+Check it still has a module first: `ls /boot/vmlinuz-*`, then
+`gpu-kernel-check <old-version>-generic`.
+
+- **At the console:** reboot, and in the GRUB menu (5 s) choose *Advanced
+  options for Ubuntu → Ubuntu, with Linux &lt;old&gt;-generic*.
+- **Remotely, one boot only:**
+  ```bash
+  grep -oE "menuentry '[^']+'" /boot/grub/grub.cfg       # exact entry names
+  sudo grub-reboot 'Advanced options for Ubuntu>Ubuntu, with Linux <old>-generic'
+  sudo GPU_GUARD_OVERRIDE=1 reboot       # the guard checks the NEWEST kernel, not the one grub-reboot picked
+  ```
+- **To stay on the old kernel:** once booted into it,
+  `sudo apt remove linux-image-<NEW>-generic linux-modules-<NEW>-generic`.
+  That makes the old kernel the newest one again. Then run `sudo update-grub`.
+
+Booting the old kernel does **not** roll back the NVIDIA *userspace*. If the
+new driver itself is the problem, downgrade it with
+`sudo apt install nvidia-driver-580-open=<old-version> …`, but only if that
+version still appears in `apt-cache policy nvidia-driver-580-open`.
+
+### NVIDIA container toolkit: next maintenance window
+
+Installed: `nvidia-container-toolkit` **1.17.8**. Available: **1.20.2**, from
+nvidia.github.io. That repo is not an unattended-upgrades origin, so the
+toolkit never updates by itself. Update it in a window, because it restarts
+every container:
+
+```bash
+sudo apt install nvidia-container-toolkit nvidia-container-toolkit-base libnvidia-container-tools libnvidia-container1
+grep -A3 '"nvidia"' /etc/docker/daemon.json      # the nvidia runtime entry must still be there
+sudo systemctl restart docker
+docker exec ruth-ai-unified-runtime nvidia-smi -L
+```
+
 ## The two operator URLs
 
 | URL | Purpose | Port var |
@@ -562,3 +686,163 @@ docker compose up -d --no-deps ruth-ai-backend ruth-ai-frontend
 
 The downgrade keeps the latest interval per (project, camera) and deletes
 "cameras" job rows.
+
+## Product branding (white-label) (migration `product_branding`, 2026-11)
+
+Whose product this is: Visics today, RuthLabs for investor demos, a
+licensee's brand when licensed. Set under **Settings → System → Branding**
+(admin to change; anyone sees which brand is active). Not the customer on
+report covers, which stays under **Settings → Reports**.
+
+* **Brand profiles**: label, product name, optional short name, assistant
+  name ("Ask …" on the Overview), accent colour (≥ 3:1 on white), report
+  cover note, and three images: logo for light backgrounds, logo for dark
+  backgrounds, icon (favicon). One profile is active; **Activate** switches
+  it after a confirmation. Open screens follow within a minute.
+* **Where the active brand shows**: header logo, admin sign-in page, tab
+  title, favicon, fullscreen camera page, "Ask …" chat title, report cover
+  ("Prepared by" logo and note, cover band colour), report footer
+  ("<product> · Page n of m"), PDF author, analytics export file names
+  when downloaded straight from the API (the UI already names them
+  `analytics-report-<date>`), and the chat assistant's persona once the NLP
+  chat service runs again.
+* **Open endpoints** (needed before sign-in): `GET /api/v1/branding` (the
+  active brand only: no other profiles, no ids, no audit fields) and
+  `GET /api/v1/branding/asset/{logo_light|logo_dark|icon}`.
+* **Uploads**: PNG or JPEG, ≤ 1 MB, re-encoded as PNG on the server
+  (logos fit 600 × 300 px; the icon must be nearly square and becomes
+  256 × 256). SVG is refused.
+* **Migration** seeds one profile, **Visics** (product name "Visics AI",
+  assistant "Visi"), active, using images shipped in the backend image
+  (`app/assets/branding/builtin-*.png`). Nothing changes on screen except
+  that the fullscreen camera page now says "Visics AI" instead of "Ruth AI".
+* Internal identifiers (API title, health service name, containers,
+  package names) are unchanged.
+
+### Backup and restore
+
+The branding lives in two places; back up and restore **both**:
+
+| What | Where (container) | Where (host, this stack) | In `pg_dump`? |
+|---|---|---|---|
+| Profiles and which is active | `app_settings` row `product_branding` | Ruth database | yes |
+| Uploaded product images | `/evidence/product-branding/*.png` | `${RUTH_EVIDENCE_HOST_DIR:-/mnt/storage/ruth-evidence}/product-branding/` | **no** |
+| Customer (report) branding row | `app_settings` row `report_branding` | Ruth database | yes |
+| Customer report logo | `/evidence/branding/logo-*.png` | `${RUTH_EVIDENCE_HOST_DIR:-/mnt/storage/ruth-evidence}/branding/` | **no** |
+
+```bash
+TS=$(date +%Y%m%d-%H%M%S)
+# Back up (with the database dump):
+tar -C /mnt/storage/ruth-evidence -czf /mnt/storage/ruth-backups/branding-$TS.tgz branding product-branding
+# Restore (after restoring the database dump):
+tar -C /mnt/storage/ruth-evidence -xzf /mnt/storage/ruth-backups/branding-<TS>.tgz
+chown -R 1000:1000 /mnt/storage/ruth-evidence/branding /mnt/storage/ruth-evidence/product-branding
+```
+
+A restored database whose images are missing still works: the UI shows
+the product name in place of a missing logo, and the report cover prints
+the name. The built-in Visics images come with the backend image and need
+no backup. To get back to Visics at any time: **Settings → System →
+Branding → Visics → Activate**.
+
+### Deploy
+
+Same steps as before: verified dumps of both databases to
+`/mnt/storage/ruth-backups/`, the branding tarball above, tag the current
+images (`:pre-product-branding`), rebuild and restart the backend and
+frontend.
+
+```bash
+docker exec ruth-ai-vas-postgres psql -U ruth -d ruth_ai -c "select version_num from alembic_version"   # product_branding
+curl -s http://localhost:8090/api/v1/branding    # {"product_name":"Visics AI", ...}
+```
+
+### Roll back
+
+Switch to Visics first if another brand is active, then:
+
+```bash
+docker compose stop ruth-ai-backend
+docker compose run --rm --no-deps --entrypoint alembic ruth-ai-backend downgrade project_camera_membership   # run with the NEW image
+docker tag vas-ruthai-deploy-ruth-ai-backend:pre-product-branding  vas-ruthai-deploy-ruth-ai-backend:latest
+docker tag vas-ruthai-deploy-ruth-ai-frontend:pre-product-branding vas-ruthai-deploy-ruth-ai-frontend:latest
+docker compose up -d --no-deps ruth-ai-backend ruth-ai-frontend
+```
+
+The downgrade deletes the `product_branding` row; uploaded images stay in
+`/evidence/product-branding/` (harmless).
+
+## VAS: neutral wording (separate small release, 2026-11)
+
+VAS's own UI no longer names the product it feeds: "For RuthAI
+Integration" on the login form and in the header's sign-in help now reads
+"For integrations", and the stock Next.js favicon is replaced by a plain
+grey lens icon. VAS keeps its generic name ("VAS - Video Aggregation
+Service") and does not follow the product brand. No backend change, no
+migration.
+
+```bash
+docker tag vas-ruthai-deploy-vas-frontend:latest vas-ruthai-deploy-vas-frontend:pre-neutral
+docker compose build vas-frontend && docker compose up -d --no-deps vas-frontend
+# Roll back:
+docker tag vas-ruthai-deploy-vas-frontend:pre-neutral vas-ruthai-deploy-vas-frontend:latest
+docker compose up -d --no-deps vas-frontend
+```
+
+## GPU outage detection (2026-11)
+
+After the 24 Aug outage, a missing GPU or a dead AI Runtime is now loud:
+
+- **Runtimes:** `GPU_FALLBACK_TO_CPU=false`. A model that can't get the GPU
+  fails to load instead of running on CPU. `/health` reports `degraded` or
+  `unhealthy` with `reasons` (`gpu_unavailable: …`, `models_failed: …`,
+  `models_on_cpu: …`) and each model's `device`. It still answers HTTP 200,
+  so the Docker healthcheck doesn't restart-loop.
+- **Ruth backend:** the `ai_runtime` component live-probes the runtime.
+  GPU missing and runtime unreachable are both `unhealthy`. System Health
+  shows a red banner; the top bar shows red "System Fault".
+- **Ruth Stream bell:** "GPU missing - AI detection down" / "AI Runtime down"
+  alerts, read from Ruth's health via `RUTH_AI_HEALTH_URL`. Polled every 30 s,
+  cached 20 s server-side.
+
+**Deployed 2026-11-19.** Images: `ruth-ai-unified-runtime:2026.11-gpu-required`
+(unified) and `:2026.11-gpu-required-offload` (store). Same build, two tags;
+offload stays switched on by env for the store runtime only. Dependencies are
+identical to `2026.10-*` (same `pip freeze`). Pre-deploy DB dumps:
+`/mnt/storage/ruth-backups/{ruth_ai,vas_db}-pre-gpu-detect-20261119-021902.dump`.
+
+```bash
+cd vas-ruthai-deploy
+# Rollback tags for the compose-built images (runtimes keep their 2026.10-* tags).
+for i in vas-ruthai-deploy-ruth-ai-backend vas-ruthai-deploy-ruth-ai-frontend vas-ruthai-deploy-vas-frontend; do
+  docker tag $i:latest $i:pre-gpu-detect; done
+(cd ../ruth-ai-vas-ms-v2/ai && docker build --build-arg VARIANT=gpu \
+  -t ruth-ai-unified-runtime:2026.11-gpu-required -t ruth-ai-unified-runtime:2026.11-gpu-required-offload .)
+docker compose build ruth-ai-backend ruth-ai-frontend vas-frontend
+# Runtimes first, so the backend has something to probe.
+docker compose --profile model-store up -d --no-deps unified-ai-runtime model-store-runtime
+docker compose up -d --no-deps ruth-ai-backend ruth-ai-frontend
+# vas-backend runs the bind-mounted ../vas-ms-v2/backend source: no build.
+# `up -d` recreates it with RUTH_AI_HEALTH_URL. Cameras auto-resume.
+docker compose up -d --no-deps vas-backend vas-frontend
+```
+
+Verify: both runtimes `healthy` with every model on `cuda:0`
+(`/health?verbose=true`), Ruth `/api/v1/health` `healthy` with
+`ai_runtime.details.gpu_available: true`, and no AI alert in the bell.
+
+**Expected right after a Ruth backend restart:** the AI Runtime shows
+unhealthy ("no AI Runtime registered") for up to ~60 s, until the runtime's
+next capability publish re-registers it. The registry is in memory.
+
+Roll back:
+
+```bash
+sed -i 's/2026.11-gpu-required-offload/2026.10-offload/; s/2026.11-gpu-required$/2026.10-pinned/' docker-compose.yml
+for i in vas-ruthai-deploy-ruth-ai-backend vas-ruthai-deploy-ruth-ai-frontend vas-ruthai-deploy-vas-frontend; do
+  docker tag $i:pre-gpu-detect $i:latest; done
+docker compose --profile model-store up -d --no-deps unified-ai-runtime model-store-runtime
+docker compose up -d --no-deps ruth-ai-backend ruth-ai-frontend vas-frontend
+# vas-backend: revert its source files; the new endpoint is inert without RUTH_AI_HEALTH_URL.
+```
+
