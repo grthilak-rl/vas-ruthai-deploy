@@ -484,6 +484,12 @@ networks:
   ruth-ai-internal:
     name: ruth-ai-vas-internal
     driver: bridge
+    # Pinned so Docker never auto-picks a 172.16.0.0/12 range that can
+    # overlap a client LAN. Override per site via RUTH_NET_SUBNET in .env
+    # (see DEPLOYMENT.md, "Docker network subnets").
+    ipam:
+      config:
+        - subnet: ${RUTH_NET_SUBNET:-198.18.11.0/24}
 
 
 # =============================================================================

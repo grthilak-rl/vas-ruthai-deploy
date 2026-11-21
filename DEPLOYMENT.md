@@ -411,6 +411,64 @@ healthy either way.
 | VAS Redis | 6380 | `VAS_REDIS_HOST_PORT` | |
 | MediaSoup WebRTC | 3001 + 20000–20999 RTC | `MEDIASOUP_PORT`, `MEDIASOUP_RTC_MIN/MAX_PORT` | host network |
 
+## Docker network subnets
+
+The two bridge networks have fixed subnets, so Docker never picks a
+range that clashes with the site LAN:
+
+| Network | Default subnet | Variable | Members |
+|---|---|---|---|
+| `vas-ruthai-deploy-net` | `198.18.10.0/24` | `VAS_NET_SUBNET` | vas-db, vas-redis, vas-frontend |
+| `ruth-ai-vas-internal` | `198.18.11.0/24` | `RUTH_NET_SUBNET` | all Ruth services |
+
+Also set on the host in `/etc/docker/daemon.json` (needs a Docker restart):
+
+```json
+"bip": "198.18.0.1/24",
+"default-address-pools": [{ "base": "198.18.0.0/16", "size": 24 }]
+```
+
+`bip` is the default `docker0` bridge. The pool covers any other network
+Docker creates.
+
+**Why it matters.** If a bridge network overlaps the LAN, containers on it
+can't reach LAN hosts such as cameras: the traffic stays on the bridge.
+If the bridge is more specific than the LAN route (for example Docker
+`172.18.0.0/16` on a `172.16.0.0/12` LAN), the host itself loses those LAN
+addresses too, cameras and SSH clients included. Docker's built-in default
+pool (`172.17–31.x`, then `192.168.x`) is exactly what corporate LANs use.
+
+**Before deploying, check the site.** Run `ip route` on the host and ask
+the site for every range in use, including VPN and other routed subnets.
+Users can reach the server from subnets that are not on its own interface.
+
+**If the site uses 198.18.0.0/15**, choose free /24s in a range the site
+doesn't use (for example `100.127.250.0/24`, or a `10.x` /24 the site has
+confirmed is free). Then:
+
+1. In `.env`: `VAS_NET_SUBNET=<a>/24` and `RUTH_NET_SUBNET=<b>/24`, with
+   two different /24s.
+2. In `daemon.json`: move `bip` and `default-address-pools` to a third
+   free range.
+3. Apply it in a maintenance window. Named volumes keep all data.
+   ```bash
+   docker compose down --timeout 60       # removes containers + both networks
+   sudo systemctl restart docker          # only if daemon.json changed
+   docker compose up -d                   # recreates the networks with the new subnets
+   docker network inspect -f '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}' \
+     vas-ruthai-deploy-net ruth-ai-vas-internal
+   ```
+
+Changing a subnet always means recreating the network. A plain
+`up -d` won't change the subnet of an existing network. Nothing in the
+stack hard-codes container IPs: VAS host-network services reach
+db/redis/frontend through `127.0.0.1:<host port>`, and Ruth uses service
+names. One exception: if a site sets `*_ADMIN_TRUSTED_PROXY_HOSTS` to IP
+addresses, update them to match the new subnet.
+
+**Verify** that a VAS container can reach a LAN camera:
+`docker exec vas-ms-v2-redis nc -z -w2 <camera-ip> 554 && echo OK`
+
 ## Common commands
 
 | Action | Command |
