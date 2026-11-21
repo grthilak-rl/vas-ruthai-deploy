@@ -6,3 +6,7 @@
 # not part of this repo).
 *.bak
 *.bak-*
+
+# Local dumps and rollback copies. Real backups live on /mnt/storage/ruth-backups
+# (the root disk is small); never commit database dumps.
+backups/
